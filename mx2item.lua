@@ -1,4 +1,4 @@
-local script_name = "xm2item"
+local script_name = "mx2item"
 
 local function read_u1(file)
   local byte = file:read(1)
