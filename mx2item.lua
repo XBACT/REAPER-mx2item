@@ -266,31 +266,30 @@ function XMParser:parse_instrument(file)
   
   if instrument.num_samples > 0 then
     local sample_header_size = read_u4le(file)
-    skip_bytes(file, 96)  -- note_to_sample
-    skip_bytes(file, 48)  -- volume envelope
-    skip_bytes(file, 48)  -- panning envelope
-    skip_bytes(file, 14)  -- envelope settings
-    skip_bytes(file, 4)   -- vibrato
-    skip_bytes(file, 2)   -- volume fadeout
-    skip_bytes(file, 2)   -- reserved
+    skip_bytes(file, 96)
+    skip_bytes(file, 48)
+    skip_bytes(file, 48)
+    skip_bytes(file, 14)
+    skip_bytes(file, 4)
+    skip_bytes(file, 2)
+    skip_bytes(file, 2)
   end
   
   file:seek("set", inst_header_start - 4 + inst_header_size)
-  
-  -- Skip sample headers and data
+
   local total_sample_data = 0
   for s = 1, instrument.num_samples do
     local length = read_u4le(file) or 0
-    skip_bytes(file, 4)  -- loop_start
-    skip_bytes(file, 4)  -- loop_length
-    skip_bytes(file, 1)  -- volume
-    skip_bytes(file, 1)  -- finetune
+    skip_bytes(file, 4)
+    skip_bytes(file, 4) 
+    skip_bytes(file, 1)
+    skip_bytes(file, 1)
     local type_byte = read_u1(file) or 0
     local is_16bit = (type_byte & 0x10) ~= 0
-    skip_bytes(file, 1)  -- panning
-    skip_bytes(file, 1)  -- relative_note
-    skip_bytes(file, 1)  -- reserved
-    skip_bytes(file, 22) -- name
+    skip_bytes(file, 1)
+    skip_bytes(file, 1)
+    skip_bytes(file, 1)
+    skip_bytes(file, 22)
     
     if is_16bit then
       total_sample_data = total_sample_data + length * 2
@@ -299,10 +298,53 @@ function XMParser:parse_instrument(file)
     end
   end
   
-  -- Skip sample data
   skip_bytes(file, total_sample_data)
   
   return instrument
+end
+
+local function collect_instruments_per_channel(xm)
+  local channel_instruments = {}
+  for ch = 1, xm.num_channels do
+    channel_instruments[ch] = {}
+  end
+  
+  local last_instrument = {}
+  
+  for order_idx = 1, xm.song_length do
+    local pattern_idx = xm.pattern_order[order_idx] + 1
+    local pattern = xm.patterns[pattern_idx]
+    
+    if pattern then
+      for row_idx = 1, pattern.num_rows do
+        for ch = 1, xm.num_channels do
+          local cell = pattern.rows[row_idx][ch]
+          
+          if cell.note > 0 and cell.note < 97 then
+            local inst_num = cell.instrument
+            if inst_num == 0 then
+              inst_num = last_instrument[ch] or 1
+            else
+              last_instrument[ch] = inst_num
+            end
+            
+            channel_instruments[ch][inst_num] = true
+          end
+        end
+      end
+    end
+  end
+  
+  local result = {}
+  for ch = 1, xm.num_channels do
+    result[ch] = {}
+    for inst_num, _ in pairs(channel_instruments[ch]) do
+      table.insert(result[ch], inst_num)
+    end
+    table.sort(result[ch])
+  end
+  
+  return result
 end
 
 local function import_xm_to_reaper(xm)
@@ -315,13 +357,21 @@ local function import_xm_to_reaper(xm)
   local current_bpm = xm.default_bpm
   local seconds_per_row = (2.5 / current_bpm) * current_tempo
   
-  local tracks = {}
+  local channel_instruments = collect_instruments_per_channel(xm)
+  
+  local tracks = {} 
+  local parent_tracks = {} 
   local track_offset = reaper.CountTracks(0)
+  local current_track_idx = track_offset
   
   for ch = 1, xm.num_channels do
-    reaper.InsertTrackAtIndex(track_offset + ch - 1, true)
-    local track = reaper.GetTrack(0, track_offset + ch - 1)
-    reaper.GetSetMediaTrackInfo_String(track, "P_NAME", 
+    tracks[ch] = {}
+    local instruments_in_channel = channel_instruments[ch]
+    local num_instruments = #instruments_in_channel
+    
+    reaper.InsertTrackAtIndex(current_track_idx, true)
+    local parent_track = reaper.GetTrack(0, current_track_idx)
+    reaper.GetSetMediaTrackInfo_String(parent_track, "P_NAME", 
       string.format("[%s] Ch %02d", xm.module_name:sub(1, 8), ch), true)
     
     local pan = 0
@@ -330,15 +380,99 @@ local function import_xm_to_reaper(xm)
       if ch_mod == 0 or ch_mod == 3 then pan = -0.5
       else pan = 0.5 end
     end
-    reaper.SetMediaTrackInfo_Value(track, "D_PAN", pan)
+    reaper.SetMediaTrackInfo_Value(parent_track, "D_PAN", pan)
     
-    tracks[ch] = track
+    parent_tracks[ch] = parent_track
+    current_track_idx = current_track_idx + 1
+    
+    if num_instruments <= 1 then
+      local inst_num = instruments_in_channel[1] or 1
+      tracks[ch][inst_num] = parent_track
+    else
+      reaper.SetMediaTrackInfo_Value(parent_track, "I_FOLDERDEPTH", 1) 
+      
+      for i, inst_num in ipairs(instruments_in_channel) do
+        reaper.InsertTrackAtIndex(current_track_idx, true)
+        local child_track = reaper.GetTrack(0, current_track_idx)
+        
+        local inst_name = ""
+        if xm.instruments[inst_num] then
+          inst_name = xm.instruments[inst_num].name or ""
+        end
+        if inst_name == "" then
+          inst_name = string.format("Inst %02d", inst_num)
+        end
+        
+        reaper.GetSetMediaTrackInfo_String(child_track, "P_NAME", 
+          string.format("I%02d: %s", inst_num, inst_name), true)
+        
+        local color = reaper.ColorToNative((inst_num * 37) % 256, 
+                                            (inst_num * 73) % 256, 
+                                            (inst_num * 113) % 256) | 0x1000000
+        reaper.SetMediaTrackInfo_Value(child_track, "I_CUSTOMCOLOR", color)
+        
+        if i == num_instruments then
+          reaper.SetMediaTrackInfo_Value(child_track, "I_FOLDERDEPTH", -1)
+        end
+        
+        tracks[ch][inst_num] = child_track
+        current_track_idx = current_track_idx + 1
+      end
+    end
   end
   
   local current_time = 0
   local active_notes = {}
   local last_instrument = {}
   local items_created = 0
+  
+  local function create_item_for_note(an, ch)
+    if an.end_time <= an.start_time then return end
+    
+    local target_track = tracks[ch][an.instrument]
+    if not target_track then
+      target_track = parent_tracks[ch]
+    end
+    
+    local item = reaper.AddMediaItemToTrack(target_track)
+    if item then
+      reaper.SetMediaItemPosition(item, an.start_time, false)
+      reaper.SetMediaItemLength(item, an.end_time - an.start_time, false)
+      reaper.SetMediaItemInfo_Value(item, "D_PLAYRATE", 1.0)
+      
+      local color = reaper.ColorToNative((an.instrument * 37) % 256, 
+                                          (an.instrument * 73) % 256, 
+                                          (an.instrument * 113) % 256) | 0x1000000
+      reaper.SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", color)
+      
+      local semitones = xm_note_to_semitones_from_c4(an.xm_note)
+      local note_info = string.format(
+        "Note: %s\nInstrument: %d\nPitch: %+d st\nVolume: %d",
+        xm_note_to_name(an.xm_note),
+        an.instrument,
+        semitones or 0,
+        an.volume
+      )
+      reaper.GetSetMediaItemInfo_String(item, "P_NOTES", note_info, true)
+      
+      local take = reaper.AddTakeToMediaItem(item)
+      if take then
+        reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME",
+          string.format("%s I%02d V%02d", 
+            xm_note_to_name(an.xm_note), 
+            an.instrument, 
+            an.volume), true)
+        
+        if semitones then
+          reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", semitones)
+        end
+        
+        reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", an.volume / 64)
+      end
+      
+      items_created = items_created + 1
+    end
+  end
   
   for order_idx = 1, xm.song_length do
     local pattern_idx = xm.pattern_order[order_idx] + 1
@@ -390,47 +524,7 @@ local function import_xm_to_reaper(xm)
             if active_notes[ch] then
               local an = active_notes[ch]
               an.end_time = row_time + note_delay
-              
-              if an.end_time > an.start_time then
-                local item = reaper.AddMediaItemToTrack(tracks[ch])
-                if item then
-                  reaper.SetMediaItemPosition(item, an.start_time, false)
-                  reaper.SetMediaItemLength(item, an.end_time - an.start_time, false)
-                  reaper.SetMediaItemInfo_Value(item, "D_PLAYRATE", 1.0)
-                  
-                  local color = reaper.ColorToNative((an.instrument * 37) % 256, 
-                                                      (an.instrument * 73) % 256, 
-                                                      (an.instrument * 113) % 256) | 0x1000000
-                  reaper.SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", color)
-                  
-                  local semitones = xm_note_to_semitones_from_c4(an.xm_note)
-                  local note_info = string.format(
-                    "Note: %s\nInstrument: %d\nPitch: %+d st\nVolume: %d",
-                    xm_note_to_name(an.xm_note),
-                    an.instrument,
-                    semitones or 0,
-                    an.volume
-                  )
-                  reaper.GetSetMediaItemInfo_String(item, "P_NOTES", note_info, true)
-                  
-                  local take = reaper.AddTakeToMediaItem(item)
-                  if take then
-                    reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME",
-                      string.format("%s I%02d V%02d", 
-                        xm_note_to_name(an.xm_note), 
-                        an.instrument, 
-                        an.volume), true)
-                    
-                    if semitones then
-                      reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", semitones)
-                    end
-                    
-                    reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", an.volume / 64)
-                  end
-                  
-                  items_created = items_created + 1
-                end
-              end
+              create_item_for_note(an, ch)
               active_notes[ch] = nil
             end
             
@@ -465,46 +559,7 @@ local function import_xm_to_reaper(xm)
             if active_notes[ch] then
               local an = active_notes[ch]
               an.end_time = row_time + note_delay
-              
-              if an.end_time > an.start_time then
-                local item = reaper.AddMediaItemToTrack(tracks[ch])
-                if item then
-                  reaper.SetMediaItemPosition(item, an.start_time, false)
-                  reaper.SetMediaItemLength(item, an.end_time - an.start_time, false)
-                  reaper.SetMediaItemInfo_Value(item, "D_PLAYRATE", 1.0)
-                  
-                  local color = reaper.ColorToNative((an.instrument * 37) % 256, 
-                                                      (an.instrument * 73) % 256, 
-                                                      (an.instrument * 113) % 256) | 0x1000000
-                  reaper.SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", color)
-                  
-                  local semitones = xm_note_to_semitones_from_c4(an.xm_note)
-                  local note_info = string.format(
-                    "Note: %s\nInstrument: %d\nPitch: %+d st\nVolume: %d",
-                    xm_note_to_name(an.xm_note),
-                    an.instrument,
-                    semitones or 0,
-                    an.volume
-                  )
-                  reaper.GetSetMediaItemInfo_String(item, "P_NOTES", note_info, true)
-                  
-                  local take = reaper.AddTakeToMediaItem(item)
-                  if take then
-                    reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME",
-                      string.format("%s I%02d V%02d", 
-                        xm_note_to_name(an.xm_note), 
-                        an.instrument, 
-                        an.volume), true)
-                    
-                    if semitones then
-                      reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", semitones)
-                    end
-                    reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", an.volume / 64)
-                  end
-                  
-                  items_created = items_created + 1
-                end
-              end
+              create_item_for_note(an, ch)
               active_notes[ch] = nil
             end
             
@@ -522,46 +577,7 @@ local function import_xm_to_reaper(xm)
           if an.end_time > pattern_end_time then
             an.end_time = pattern_end_time
           end
-          
-          if an.end_time > an.start_time then
-            local item = reaper.AddMediaItemToTrack(tracks[ch])
-            if item then
-              reaper.SetMediaItemPosition(item, an.start_time, false)
-              reaper.SetMediaItemLength(item, an.end_time - an.start_time, false)
-              reaper.SetMediaItemInfo_Value(item, "D_PLAYRATE", 1.0)
-              
-              local color = reaper.ColorToNative((an.instrument * 37) % 256, 
-                                                  (an.instrument * 73) % 256, 
-                                                  (an.instrument * 113) % 256) | 0x1000000
-              reaper.SetMediaItemInfo_Value(item, "I_CUSTOMCOLOR", color)
-              
-              local semitones = xm_note_to_semitones_from_c4(an.xm_note)
-              local note_info = string.format(
-                "Note: %s\nInstrument: %d\nPitch: %+d st\nVolume: %d",
-                xm_note_to_name(an.xm_note),
-                an.instrument,
-                semitones or 0,
-                an.volume
-              )
-              reaper.GetSetMediaItemInfo_String(item, "P_NOTES", note_info, true)
-              
-              local take = reaper.AddTakeToMediaItem(item)
-              if take then
-                reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME",
-                  string.format("%s I%02d V%02d", 
-                    xm_note_to_name(an.xm_note), 
-                    an.instrument, 
-                    an.volume), true)
-                
-                if semitones then
-                  reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", semitones)
-                end
-                reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", an.volume / 64)
-              end
-              
-              items_created = items_created + 1
-            end
-          end
+          create_item_for_note(an, ch)
           active_notes[ch] = nil
         end
       end
@@ -625,7 +641,6 @@ local function main()
       "Import complete!\n\n" ..
       "• %d empty items created\n" ..
       "• %d channel tracks\n\n" ..
-      "Item info stored in:\n" ,
       items_created,
       xm.num_channels
     ),
